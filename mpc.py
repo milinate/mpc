@@ -10,8 +10,12 @@ import urllib.request
 import hashlib
 import json
 import time
+import tempfile
+import threading
+import concurrent.futures
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
+import re
 
 MPC_ROOT = Path("/etc/mpc")
 MPC_LIST = MPC_ROOT / "list"
@@ -19,6 +23,16 @@ MPC_REPOS = MPC_ROOT / "repos.list"
 MPC_CACHE = MPC_ROOT / "cache"
 MPC_BIN = Path("/usr/bin/mpc")
 MPC_DB = MPC_ROOT / "installed.db"
+
+DANGEROUS_COMMANDS = [
+    (r'rm\s+-rf\s+/?\*?', "rm -rf /"),
+    (r'dd\s+if=/dev/zero\s+of=/dev/sd[a-z]', "dd if=/dev/zero of=/dev/sdX"),
+    (r'mkfs\.[a-z]+', "mkfs"),
+    (r'chmod\s+777\s+/', "chmod 777 /"),
+    (r'chown\s+-R\s+root\s+/', "chown -R root /"),
+    (r'>\s*/dev/sd[a-z]', "перезапись диска"),
+    (r':\(\)\s*\{\s*:\|:&\s*\};:', "fork bomb"),
+]
 
 def init():
     MPC_ROOT.mkdir(exist_ok=True)
@@ -65,7 +79,22 @@ def extract_mp(package_path: Path, dest_dir: Path) -> bool:
     except:
         return False
 
-def install_package(package_path: Path, repo_mode: bool = False):
+def check_script_safety(script_path: Path) -> Tuple[bool, str]:
+    if not script_path.exists():
+        return True, ""
+    
+    try:
+        content = script_path.read_text()
+    except:
+        return True, ""
+    
+    for pattern, description in DANGEROUS_COMMANDS:
+        if re.search(pattern, content, re.MULTILINE):
+            return False, f"Обнаружена опасная команда: {description}"
+    
+    return True, ""
+
+def install_package(package_path: Path, repo_mode: bool = False, chroot: Optional[Path] = None, jobs: int = 1):
     if repo_mode:
         print(f"Searching for {package_path} in repositories...")
         found = False
@@ -122,11 +151,47 @@ def install_package(package_path: Path, repo_mode: bool = False):
     deps = meta.get("depends", "").split()
     db = load_db()
     for dep in deps:
-        if dep not in db:
-            print(f"Missing dependency: {dep}")
+        if ">=" in dep or "<=" in dep or "==" in dep:
+            import re
+            match = re.match(r'([a-zA-Z0-9_-]+)([><=]+)(.+)', dep)
+            if match:
+                dep_name, op, dep_ver = match.groups()
+                if dep_name not in db:
+                    print(f"Missing dependency: {dep_name}")
+                    shutil.rmtree(temp_dir)
+                    return
+                installed_ver = db[dep_name].get("version", "")
+                try:
+                    if op == ">=" and installed_ver < dep_ver:
+                        print(f"Dependency {dep_name} version {installed_ver} < {dep_ver}")
+                        shutil.rmtree(temp_dir)
+                        return
+                    elif op == "<=" and installed_ver > dep_ver:
+                        print(f"Dependency {dep_name} version {installed_ver} > {dep_ver}")
+                        shutil.rmtree(temp_dir)
+                        return
+                    elif op == "==" and installed_ver != dep_ver:
+                        print(f"Dependency {dep_name} version {installed_ver} != {dep_ver}")
+                        shutil.rmtree(temp_dir)
+                        return
+                except:
+                    pass
+        else:
+            if dep not in db:
+                print(f"Missing dependency: {dep}")
+                shutil.rmtree(temp_dir)
+                return
+
+    for script_name in ["postinstall.sh", "whileinstall.sh", "pastinstall.sh", "remove.sh"]:
+        script_path = temp_dir / script_name
+        safe, error = check_script_safety(script_path)
+        if not safe:
+            print(f"ПОШЁЛ НАХУЙ: {error}")
             shutil.rmtree(temp_dir)
             return
 
+    root_dir = chroot if chroot else Path("/")
+    
     post_script = temp_dir / "postinstall.sh"
     if post_script.exists():
         subprocess.run(["bash", post_script], check=False)
@@ -134,7 +199,16 @@ def install_package(package_path: Path, repo_mode: bool = False):
     files_archive = temp_dir / "files.tar.gz"
     if files_archive.exists():
         with tarfile.open(files_archive, "r:gz") as files_tar:
-            files_tar.extractall("/")
+            members = files_tar.getmembers()
+            total = len(members)
+            extracted = 0
+            for member in members:
+                files_tar.extract(member, root_dir)
+                extracted += 1
+                if total > 0:
+                    percent = (extracted * 100) // total
+                    print(f"\rРаспаковка: {percent}% ({extracted}/{total})", end="")
+            print()
 
     while_script = temp_dir / "whileinstall.sh"
     if while_script.exists():
@@ -151,7 +225,8 @@ def install_package(package_path: Path, repo_mode: bool = False):
 
     db[pkg_name] = {
         "version": meta.get("version", "unknown"),
-        "install_date": int(time.time())
+        "install_date": int(time.time()),
+        "hash": hash_file(package_path) if package_path.exists() else ""
     }
     save_db(db)
 
@@ -168,6 +243,10 @@ def remove_package(pkg_name: str):
 
     remove_script = pkg_dir / "remove.sh"
     if remove_script.exists():
+        safe, error = check_script_safety(remove_script)
+        if not safe:
+            print(f"пошел нахуй")
+            return
         subprocess.run(["bash", remove_script], check=False)
 
     shutil.rmtree(pkg_dir)
@@ -196,8 +275,14 @@ def info_package(pkg_name: str):
     if meta_file.exists():
         with open(meta_file) as f:
             print(f.read().strip())
+    
+    db = load_db()
+    if pkg_name in db:
+        print(f"\nInstall date: {time.ctime(db[pkg_name].get('install_date', 0))}")
+        if db[pkg_name].get("hash"):
+            print(f"SHA256: {db[pkg_name]['hash'][:16]}...")
 
-def build_package(source_dir: Path):
+def build_package(source_dir: Path, jobs: int = 1, progress: bool = True):
     source_dir = Path(source_dir).resolve()
     if not source_dir.exists():
         print(f"Directory {source_dir} not found")
@@ -221,6 +306,8 @@ def build_package(source_dir: Path):
         print("Meta missing name field")
         return
 
+    print(f"Building {pkg_name}-{version}.mp...")
+    
     temp_dir = MPC_CACHE / f"build_{pkg_name}"
     if temp_dir.exists():
         shutil.rmtree(temp_dir)
@@ -236,8 +323,36 @@ def build_package(source_dir: Path):
     prog_dir = source_dir / "prog"
     if prog_dir.exists():
         files_archive = temp_dir / "files.tar.gz"
+        
+        if progress:
+            print("Упаковка файлов...")
+        
         with tarfile.open(files_archive, "w:gz") as tar:
-            tar.add(prog_dir, arcname=".")
+            all_files = []
+            for root, dirs, files in os.walk(prog_dir):
+                for f in files:
+                    all_files.append(Path(root) / f)
+            
+            total = len(all_files)
+            packed = 0
+            
+            def add_file(filepath):
+                nonlocal packed
+                tar.add(filepath, arcname=filepath.relative_to(prog_dir))
+                packed += 1
+                if progress and total > 0:
+                    percent = (packed * 100) // total
+                    print(f"\rУпаковка: {percent}% ({packed}/{total})", end="")
+            
+            if jobs > 1 and total > 100:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+                    executor.map(add_file, all_files)
+            else:
+                for filepath in all_files:
+                    add_file(filepath)
+            
+            if progress:
+                print()
 
     output_file = Path(f"{pkg_name}-{version}.mp")
     with tarfile.open(output_file, "w:gz") as tar:
@@ -245,7 +360,55 @@ def build_package(source_dir: Path):
             tar.add(item, arcname=item.name)
 
     shutil.rmtree(temp_dir)
+    
+    pkg_hash = hash_file(output_file)
     print(f"Package created: {output_file}")
+    print(f"SHA256: {pkg_hash[:32]}...")
+
+def create_skel(pkg_name: str):
+    pkg_dir = Path(pkg_name)
+    if pkg_dir.exists():
+        print(f"Directory {pkg_name} already exists")
+        return
+    
+    pkg_dir.mkdir()
+    (pkg_dir / "prog").mkdir()
+    
+    with open(pkg_dir / "meta", "w") as f:
+        f.write(f"""name={pkg_name}
+version=1.0.0
+depends=
+author=Your Name <email>
+description=Description of {pkg_name}
+""")
+    
+    with open(pkg_dir / "postinstall.sh", "w") as f:
+        f.write("""#!/bin/sh
+echo "Post-install script for {pkg_name}"
+""")
+    os.chmod(pkg_dir / "postinstall.sh", 0o755)
+    
+    with open(pkg_dir / "whileinstall.sh", "w") as f:
+        f.write("""#!/bin/sh
+echo "Processing $FILE"
+""")
+    os.chmod(pkg_dir / "whileinstall.sh", 0o755)
+    
+    with open(pkg_dir / "pastinstall.sh", "w") as f:
+        f.write("""#!/bin/sh
+
+echo "Past-install script for {pkg_name}"
+""")
+    os.chmod(pkg_dir / "pastinstall.sh", 0o755)
+    
+    with open(pkg_dir / "remove.sh", "w") as f:
+        f.write("""#!/bin/sh
+
+echo "Removing {pkg_name}"
+""")
+    os.chmod(pkg_dir / "remove.sh", 0o755)
+    
+    print(f"Skeleton for {pkg_name} created in ./{pkg_name}")
 
 def repo_add(url: str):
     with open(MPC_REPOS, "a") as f:
@@ -268,7 +431,7 @@ def repo_list():
             for repo in f.read().splitlines():
                 print(repo)
 
-def update_index():
+def update_index(jobs: int = 1):
     if not MPC_REPOS.exists():
         print("No repositories configured")
         return
@@ -278,10 +441,12 @@ def update_index():
         repos = f.read().splitlines()
 
     all_packages = {}
-    for repo in repos:
+    
+    def process_repo(repo):
         repo_url = repo.rstrip("/")
         index_url = f"{repo_url}/index"
         index_path = MPC_CACHE / f"index_{hashlib.md5(repo.encode()).hexdigest()}"
+        result = {}
         if download_file(index_url, index_path):
             with open(index_path) as f:
                 for line in f:
@@ -289,8 +454,16 @@ def update_index():
                     if len(parts) >= 2:
                         pkg_name = parts[0]
                         pkg_version = parts[1]
-                        pkg_repo = repo
-                        all_packages[pkg_name] = {"version": pkg_version, "repo": repo}
+                        result[pkg_name] = {"version": pkg_version, "repo": repo}
+        return result
+    
+    if jobs > 1 and len(repos) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            for repo_result in executor.map(process_repo, repos):
+                all_packages.update(repo_result)
+    else:
+        for repo in repos:
+            all_packages.update(process_repo(repo))
 
     index_file = MPC_ROOT / "package_index.json"
     with open(index_file, "w") as f:
@@ -319,7 +492,7 @@ def search_packages(query: str):
     for name, version, repo in results:
         print(f"{name} {version} [{repo}]")
 
-def upgrade_all():
+def upgrade_all(jobs: int = 1):
     print("Upgrading all packages...")
     db = load_db()
     index_file = MPC_ROOT / "package_index.json"
@@ -336,7 +509,7 @@ def upgrade_all():
             new_version = available[pkg_name]["version"]
             if current_version != new_version:
                 print(f"Upgrading {pkg_name} {current_version} -> {new_version}")
-                install_package(Path(pkg_name), repo_mode=True)
+                install_package(Path(pkg_name), repo_mode=True, jobs=jobs)
 
 def main():
     init()
@@ -346,7 +519,9 @@ def main():
 
     p_install = subparsers.add_parser("install", help="Install package")
     p_install.add_argument("package", help="Package name or .mp file path")
-
+    p_install.add_argument("--chroot", type=str, help="Install to different root directory")
+    p_install.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs")
+    
     p_remove = subparsers.add_parser("remove", help="Remove package")
     p_remove.add_argument("package", help="Package name")
 
@@ -357,6 +532,11 @@ def main():
 
     p_build = subparsers.add_parser("build", help="Build package from source")
     p_build.add_argument("source_dir", help="Source directory with meta and prog")
+    p_build.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs")
+    p_build.add_argument("--no-progress", action="store_true", help="Disable progress display")
+
+    p_skel = subparsers.add_parser("skel", help="Create package skeleton")
+    p_skel.add_argument("name", help="Package name")
 
     p_repo = subparsers.add_parser("repo", help="Manage repositories")
     p_repo_sub = p_repo.add_subparsers(dest="repo_action", required=True)
@@ -366,21 +546,24 @@ def main():
     p_repo_remove.add_argument("url")
     p_repo_sub.add_parser("list", help="List repositories")
 
-    subparsers.add_parser("update", help="Update package index")
+    p_update = subparsers.add_parser("update", help="Update package index")
+    p_update.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs")
 
     p_search = subparsers.add_parser("search", help="Search packages")
     p_search.add_argument("query", help="Search query")
 
-    subparsers.add_parser("upgrade", help="Upgrade all packages")
+    p_upgrade = subparsers.add_parser("upgrade", help="Upgrade all packages")
+    p_upgrade.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs")
 
     args = parser.parse_args()
 
     if args.command == "install":
         path = Path(args.package)
+        chroot = Path(args.chroot) if args.chroot else None
         if path.exists():
-            install_package(path)
+            install_package(path, repo_mode=False, chroot=chroot, jobs=args.jobs)
         else:
-            install_package(Path(args.package), repo_mode=True)
+            install_package(Path(args.package), repo_mode=True, chroot=chroot, jobs=args.jobs)
     elif args.command == "remove":
         remove_package(args.package)
     elif args.command == "list":
@@ -388,7 +571,9 @@ def main():
     elif args.command == "info":
         info_package(args.package)
     elif args.command == "build":
-        build_package(Path(args.source_dir))
+        build_package(Path(args.source_dir), jobs=args.jobs, progress=not args.no_progress)
+    elif args.command == "skel":
+        create_skel(args.name)
     elif args.command == "repo":
         if args.repo_action == "add":
             repo_add(args.url)
@@ -397,11 +582,11 @@ def main():
         elif args.repo_action == "list":
             repo_list()
     elif args.command == "update":
-        update_index()
+        update_index(jobs=args.jobs)
     elif args.command == "search":
         search_packages(args.query)
     elif args.command == "upgrade":
-        upgrade_all()
+        upgrade_all(jobs=args.jobs)
 
 if __name__ == "__main__":
     main()
