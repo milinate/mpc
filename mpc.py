@@ -73,9 +73,8 @@ def download_file(url: str, dest: Path) -> bool:
 
 def extract_mp(package_path: Path, dest_dir: Path) -> bool:
     try:
-        with tarfile.open(package_path, "r:gz") as tar:
-            tar.extractall(dest_dir)
-        return True
+        result = subprocess.run(["tar", "-xzf", str(package_path), "-C", str(dest_dir)])
+        return result.returncode == 0
     except:
         return False
 
